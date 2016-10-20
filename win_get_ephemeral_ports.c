@@ -43,12 +43,12 @@ typedef RPC_STATUS (__stdcall *NSI_DISCONNECT_FROM_SERVER)(
 typedef RPC_STATUS (__stdcall *NSI_RPC_GET_ALL_PARAMETERS)(
 	RPC_BINDING_HANDLE hServerConn,
 	DWORD dwStore,
-	DWORD *pdwModuleId,
+	LPDWORD lpModuleId,
 	DWORD dwSomeNumber,
 	void *arg5,
 	void *arg6,
-	PVOID pBufferOut,
-	DWORD dwBufferOutLenLen,
+	LPVOID lpOutBuffer,
+	DWORD nOutBufferSize,
 	void *arg9,
 	void *arg10,
 	void *arg11,
@@ -60,26 +60,45 @@ DWORD NPI_MS_UDP_MODULEID[] = {
 DWORD NPI_MS_TCP_MODULEID[] = {
 	0x18, 0x01, 0x0EB004A03, 0x11D49B1A, 0x50002391, 0x0BC597704};
 
+#define NPI_STORE_PERSISTENT 0
+#define NPI_STORE_ACTIVE     1
 
-int main()
+
+BOOL GetDynamicPortRangeFromNsi(
+	int protocol,
+	unsigned int *start_port,
+	unsigned int *number_of_ports)
 {
 	NSI_CONNECT_TO_SERVER NsiConnectToServer;
 	NSI_DISCONNECT_FROM_SERVER NsiDisconnectFromServer;
 	NSI_RPC_GET_ALL_PARAMETERS NsiRpcGetAllParameters;
 	HMODULE hWinNsi;
-	RPC_STATUS status;
+	BOOLEAN success;
+	RPC_STATUS rpcstatus;
 	RPC_BINDING_HANDLE hNsiServer;
 
-	BOOL is_udp = FALSE;
 	DWORD *module_id;
 	DWORD mysterious_value;
-	DWORD store;
-	DWORD buffer_out = 0;
+	DWORD buffer = 0;
+
+	switch (protocol) {
+		case IPPROTO_TCP:
+			module_id = NPI_MS_TCP_MODULEID;
+			mysterious_value = 20;
+			break;
+		case IPPROTO_UDP:
+			module_id = NPI_MS_UDP_MODULEID;
+			mysterious_value = 4;
+			break;
+		default:
+			printf("Unhandled protocol %d\n", protocol);
+			return FALSE;
+	}
 
 	hWinNsi = LoadLibrary("winnsi.dll");
 	if (!hWinNsi) {
 		printf("Failed to load winnsi.dll\n");
-		return 1;
+		return FALSE;
 	}
 
 	NsiConnectToServer = (NSI_CONNECT_TO_SERVER)GetProcAddress(
@@ -88,46 +107,74 @@ int main()
 		hWinNsi, "NsiDisconnectFromServer");
 	NsiRpcGetAllParameters = (NSI_RPC_GET_ALL_PARAMETERS)GetProcAddress(
 		hWinNsi, "NsiRpcGetAllParameters");
-	if (!NsiConnectToServer || !NsiDisconnectFromServer || !NsiRpcGetAllParameters) {
+	if (!NsiConnectToServer || !NsiDisconnectFromServer ||
+			!NsiRpcGetAllParameters) {
 		printf("Failed to get one or more library exports\n");
-		return 1;
+		FreeLibrary(hWinNsi);
+		return FALSE;
 	}
 
 	hNsiServer = NsiConnectToServer(NULL);
 	if (!hNsiServer) {
 		printf("NsiConnectToServer failed\n");
-		return 1;
+		FreeLibrary(hWinNsi);
+		return FALSE;
 	}
 
-	store = 1;  // 1 = active, 0 = persistent
-	module_id = is_udp ? NPI_MS_UDP_MODULEID : NPI_MS_TCP_MODULEID;
-	mysterious_value = is_udp ? 4 : 20;
-
-	status = NsiRpcGetAllParameters(hNsiServer, store, module_id,
-		mysterious_value, NULL, NULL, &buffer_out, sizeof(buffer_out),
+	rpcstatus = NsiRpcGetAllParameters(hNsiServer, NPI_STORE_ACTIVE, module_id,
+		mysterious_value, NULL, NULL, &buffer, sizeof(buffer),
 		NULL, NULL, NULL, NULL);
 
-	if (status == ERROR_NOT_FOUND) {
-		printf("No info found for this store\n");
-	} else if (status == RPC_S_OK) {
-		unsigned int start_port =
-			((buffer_out << 8) & 0xFF00) | ((buffer_out >> 8) & 0x00FF);
-		unsigned int num_ports = buffer_out >> 16;
-
-		printf("Ephemeral port range for %s protocol:\n"
-			"Start port: %d\n"
-			"Number of ports: %d\n",
-			is_udp ? "udp" : "tcp", start_port, num_ports);
+	if (rpcstatus == RPC_S_OK) {
+		*start_port = ((buffer << 8) & 0xFF00) | ((buffer >> 8) & 0x00FF);
+		*number_of_ports = buffer >> 16;
+		success = TRUE;
 	} else {
-		printf("NsiRpcGetAllParameters failed, status=%lu\n", status);
+		printf("NsiRpcGetAllParameters failed, rpcstatus=%lu\n", rpcstatus);
+		success = FALSE;
 	}
 
-	status = NsiDisconnectFromServer(hNsiServer);
-	if (status != RPC_S_OK) {
-		printf("NsiDisconnectFromServer failed, status=%lu\n", status);
+	rpcstatus = NsiDisconnectFromServer(hNsiServer);
+	if (rpcstatus != RPC_S_OK) {
+		printf("NsiDisconnectFromServer failed, rpcstatus=%lu\n", rpcstatus);
+		success = FALSE;
 	}
 
 	FreeLibrary(hWinNsi);
+
+	return success;
+}
+
+
+int main(int argc, char *argv[])
+{
+	unsigned int start_port;
+	unsigned int num_ports;
+	int protocol = IPPROTO_TCP;
+	const char *protocol_str = "TCP";
+
+	if (argc > 1) {
+		if (!stricmp(argv[1], "tcp")) {
+			protocol = IPPROTO_TCP;
+			protocol_str = "TCP";
+		} else if (!stricmp(argv[1], "udp")) {
+			protocol = IPPROTO_UDP;
+			protocol_str = "UDP";
+		} else {
+			printf("Unsupported protocol '%s'\n", argv[1]);
+			return 1;
+		}
+	}
+
+	if (!GetDynamicPortRangeFromNsi(protocol, &start_port, &num_ports)) {
+		printf("Failed to get dynamic port range.\n");
+		return 1;
+	}
+
+	printf("Ephemeral port range for %s protocol:\n"
+		"Start port: %d\n"
+		"Number of ports: %d\n",
+		protocol_str, start_port, num_ports);
 
 	return 0;
 }
